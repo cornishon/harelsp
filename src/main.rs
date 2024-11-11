@@ -1,18 +1,20 @@
 // #![allow(unused)]
 #![allow(clippy::mutable_key_type)]
 
+mod doc;
+use crate::doc::Ident;
+use crate::doc::{Document, HareItem};
+
+use doc::get_identifier;
 use lsp_types::{
     notification::{DidOpenTextDocument, Notification},
     request::{GotoDefinition, Request},
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf,
-    Position, Range, ServerCapabilities, Uri,
+    CompletionOptions, DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse,
+    Location, OneOf, ServerCapabilities, Uri,
 };
-use smallvec::SmallVec;
 use smol_str::SmolStr;
 use std::{
     collections::{hash_map, HashMap},
-    fs::{self, File},
-    io::{BufRead, BufReader},
     path::{Component, Path, PathBuf},
 };
 
@@ -23,7 +25,6 @@ const HARE_PATH: &str = match option_env!("HARE_PATH") {
     None => "/usr/local/src/hare/stdlib/:/usr/local/src/hare/thirdparty/",
 };
 
-type Ident = SmallVec<[SmolStr; 4]>;
 type DynError = Box<dyn core::error::Error + Sync + Send>;
 
 fn main() -> Result<(), DynError> {
@@ -33,11 +34,15 @@ fn main() -> Result<(), DynError> {
 
     let capabilities = ServerCapabilities {
         definition_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![":".into()]),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let server_capabilities = serde_json::to_value(capabilities).unwrap();
     let _initialization_params = conn.initialize(server_capabilities)?;
-    let mut docs = HashMap::<Uri, Vec<String>>::new();
+    let mut docs = HashMap::<Uri, Document>::new();
 
     let search_paths = HARE_PATH.split(':').collect::<Vec<_>>();
 
@@ -55,7 +60,7 @@ fn main() -> Result<(), DynError> {
                         conn.sender.send(resp)?;
                     }
                     _ => {
-                        eprintln!("INFO: ignoring request: {request:?}");
+                        log::info!("ignoring request: {request:?}");
                     }
                 };
             }
@@ -78,59 +83,21 @@ fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-fn initialize_docs(
-    params: DidOpenTextDocumentParams,
-    docs: &mut HashMap<Uri, Vec<String>>,
-    search_paths: &[&str],
-) -> Result<(), DynError> {
-    let lines = params
-        .text_document
-        .text
-        .lines()
-        .map(String::from)
-        .collect::<Vec<_>>();
-    let imports = get_imports(&lines);
-    add_docs_from_imports(docs, &imports, search_paths)?;
-    let doc_path = Path::new(params.text_document.uri.path().as_str());
-    add_docs_from_directory(docs, doc_path.parent().unwrap())?;
-    docs.insert(params.text_document.uri, lines);
-    Ok(())
-}
-
-const PREFIXES: &[&str] = &[
-    "export type",
-    "export fn",
-    "export def",
-    "export let",
-    "export const",
-    "type",
-    "fn",
-    "def",
-    "let",
-    "const",
-];
-
 fn find_definition(
     params: GotoDefinitionParams,
-    docs: &HashMap<Uri, Vec<String>>,
+    docs: &HashMap<Uri, Document>,
     id: RequestId,
 ) -> Result<Message, DynError> {
-    let doc = params.text_document_position_params.text_document.uri;
+    let uri = params.text_document_position_params.text_document.uri;
     let loc = params.text_document_position_params.position;
-    let imports = get_imports(&docs[&doc]);
-    let doc_module = module_from_uri(&doc);
-    if let Some(text) = docs.get(&doc) {
-        if let Some(line) = text.get(loc.line as usize) {
-            let ident = resolve_ident(
-                doc_module.as_str(),
-                &get_identifier(line, loc.character),
-                &imports,
-            );
-            eprintln!("Resolved identifer under cursor: {ident:?}");
-            let item_module = &ident[ident.len().saturating_sub(2)];
+    let doc_module = module_from_uri(&uri);
+    if let Some(Document { lines, imports, .. }) = docs.get(&uri) {
+        if let Some(line) = lines.get(loc.line as usize) {
+            let ident = get_identifier(line, loc.character);
+            let resolved_ident = resolve_ident(doc_module.as_str(), &ident, imports);
+            let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
             for (uri, content) in module_files(docs, item_module.clone()) {
-                eprintln!("searching in: {}", uri.path());
-                if let Some(resp) = item_definition(uri, content, &ident)? {
+                if let Some(resp) = item_definition(uri, &content.items, &ident) {
                     return Ok(Response::new_ok(id.clone(), resp).into());
                 }
             }
@@ -144,86 +111,27 @@ fn find_definition(
     .into())
 }
 
-fn get_imports(source: &[String]) -> Vec<Ident> {
-    source
-        .iter()
-        .filter_map(|l| {
-            if let Some(s) = l.strip_prefix("use") {
-                let end = s.find(';')? as u32;
-                Some(get_identifier(s, end - 1))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 fn item_definition(
     doc_uri: &Uri,
-    doc_lines: &[String],
+    items: &[HareItem],
     ident: &Ident,
-) -> Result<Option<GotoDefinitionResponse>, DynError> {
-    for (ln, line) in doc_lines.iter().enumerate() {
-        for p in PREFIXES {
-            if let Some(s) = line.strip_prefix(p) {
-                let actual = s
-                    .trim()
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .next()
-                    .unwrap();
-                let expected = ident.last().unwrap().clone();
-                if actual == expected {
-                    let col = line.find(actual).unwrap();
-
-                    let resp = GotoDefinitionResponse::Scalar(Location {
-                        uri: doc_uri.clone(),
-                        range: Range::new(
-                            Position::new(ln as _, col as _),
-                            Position::new(ln as _, (col + expected.len()) as _),
-                        ),
-                    });
-
-                    return Ok(Some(resp));
-                }
-            }
+) -> Option<GotoDefinitionResponse> {
+    let expected = ident.last().unwrap().clone();
+    let local = ident.len() == 1;
+    for item in items {
+        if item.name == expected && (local || item.exported) {
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: doc_uri.clone(),
+                range: item.range,
+            }));
         }
     }
-    // let mut module_path = PathBuf::from(path);
-    // let ident = resolve_ident(ident, imports);
-    // // eprintln!("resolvec ident: {ident:?}");
-    // module_path.extend(&ident[..ident.len() - 1]);
-    // let uri = path_to_uri(&module_path)?;
-    // eprintln!("uri: {uri:?}");
-    // // eprintln!("looking for: {}", module_path.display());
-    // if module_path.is_dir() {
-    //     // eprintln!("found the module at: {}", module_path.display());
-    //     for file in fs::read_dir(module_path)?.flatten() {
-    //         let filepath = file.path();
-    //         if filepath.extension().is_some_and(|ext| ext == "ha") {
-    //             eprintln!("checking {}", filepath.display());
-    //             let content = fs::read_to_string(&filepath)?;
-    //         }
-    //     }
-    // }
-    Ok(None)
+    None
 }
 
 fn path_to_uri(filepath: &Path) -> Result<Uri, DynError> {
     let uri = format!("file://{}", filepath.display()).parse()?;
     Ok(uri)
-}
-
-fn get_identifier(line: &str, char_idx: u32) -> Ident {
-    let i = char_idx as usize;
-    let start = line[..i]
-        .rfind(|c: char| !(c.is_alphanumeric() || c == ':' || c == '_'))
-        .map(|j| j + 1)
-        .unwrap_or_default();
-    let end = line[i..]
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map(|j| i + j)
-        .unwrap_or(line.len());
-    line[start..end].split("::").map(SmolStr::from).collect()
 }
 
 fn resolve_ident(current_module: &str, ident: &Ident, imports: &[Ident]) -> Ident {
@@ -239,12 +147,26 @@ fn resolve_ident(current_module: &str, ident: &Ident, imports: &[Ident]) -> Iden
     ret
 }
 
+pub fn initialize_docs(
+    params: DidOpenTextDocumentParams,
+    docs: &mut HashMap<Uri, Document>,
+    search_paths: &[&str],
+) -> Result<(), DynError> {
+    let uri = params.text_document.uri;
+    let root = Document::open(&uri)?;
+    add_docs_from_imports(docs, &root.imports, search_paths)?;
+    let doc_path = Path::new(uri.path().as_str());
+    add_docs_from_directory(docs, doc_path.parent().unwrap())?;
+    docs.insert(uri, root);
+    Ok(())
+}
+
 fn add_docs_from_directory(
-    docs: &mut HashMap<Uri, Vec<String>>,
+    docs: &mut HashMap<Uri, Document>,
     dir_path: &Path,
 ) -> Result<(), DynError> {
     if dir_path.is_dir() {
-        let Ok(dir) = fs::read_dir(dir_path) else {
+        let Ok(dir) = std::fs::read_dir(dir_path) else {
             eprintln!("WARNING: could not open: {}", dir_path.display());
             return Ok(());
         };
@@ -253,10 +175,9 @@ fn add_docs_from_directory(
             let entry_path = entry.path();
             if entry_path.is_file() && entry_path.extension().is_some_and(|ext| ext == "ha") {
                 let uri = path_to_uri(&entry_path)?;
-                if let hash_map::Entry::Vacant(e) = docs.entry(uri) {
-                    if let Ok(file) = File::open(&entry_path) {
-                        // eprintln!("INFO: added doc: {}", entry_path.display());
-                        e.insert(BufReader::new(file).lines().collect::<Result<_, _>>()?);
+                if let hash_map::Entry::Vacant(e) = docs.entry(uri.clone()) {
+                    if let Ok(doc) = Document::open(&uri) {
+                        e.insert(doc);
                     } else {
                         eprintln!("WARNING: could not open: {}", entry_path.display());
                     }
@@ -275,7 +196,7 @@ fn add_docs_from_directory(
 }
 
 fn add_docs_from_imports(
-    docs: &mut HashMap<Uri, Vec<String>>,
+    docs: &mut HashMap<Uri, Document>,
     imports: &[Ident],
     search_paths: &[&str],
 ) -> Result<(), DynError> {
@@ -290,9 +211,9 @@ fn add_docs_from_imports(
 }
 
 fn module_files(
-    docs: &HashMap<Uri, Vec<String>>,
+    docs: &HashMap<Uri, Document>,
     current_module: SmolStr,
-) -> impl Iterator<Item = (&Uri, &Vec<String>)> {
+) -> impl Iterator<Item = (&Uri, &Document)> {
     docs.iter().filter_map(move |(k, v)| {
         let path = Path::new(k.path().as_str());
         if path.extension().is_none_or(|ext| ext != "ha") {
