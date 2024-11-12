@@ -31,6 +31,23 @@ impl Document {
             imports,
         })
     }
+
+    pub fn get_documentation(&self, item: &HareItem) -> Option<String> {
+        let item_line = item.range.start.line as usize;
+        let start = self.lines[..item_line]
+            .iter()
+            .rposition(|line| !line.starts_with("//"))?;
+        if start + 1 < item_line {
+            Some(
+                self.lines[start + 1..item_line]
+                    .iter()
+                    .map(|line| &line[2..])
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -114,5 +131,9 @@ pub fn get_identifier(line: &str, char_idx: u32) -> Ident {
         .find(|c: char| !(c.is_alphanumeric() || c == '_'))
         .map(|j| i + j)
         .unwrap_or(line.len());
-    line[start..end].split("::").map(SmolStr::from).collect()
+    line[start..end]
+        .trim_end_matches(':')
+        .split("::")
+        .map(SmolStr::from)
+        .collect()
 }

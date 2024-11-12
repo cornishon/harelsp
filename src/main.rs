@@ -13,7 +13,9 @@ use lsp_types::{
     CompletionOptions, DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse,
     Location, OneOf, ServerCapabilities, Uri,
 };
-use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse};
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
+};
 use smol_str::SmolStr;
 use std::{
     collections::{hash_map, HashMap},
@@ -111,6 +113,7 @@ fn generate_completions(
                     doc::HareKind::Def => Some(CompletionItemKind::CONSTANT),
                     doc::HareKind::Var => Some(CompletionItemKind::VARIABLE),
                 },
+                documentation: module.get_documentation(&item).map(Documentation::String),
                 ..Default::default()
             }));
         }
