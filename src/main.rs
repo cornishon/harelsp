@@ -6,12 +6,14 @@ use crate::doc::Ident;
 use crate::doc::{Document, HareItem};
 
 use doc::get_identifier;
+use lsp_types::request::Completion;
 use lsp_types::{
     notification::{DidOpenTextDocument, Notification},
     request::{GotoDefinition, Request},
     CompletionOptions, DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse,
     Location, OneOf, ServerCapabilities, Uri,
 };
+use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse};
 use smol_str::SmolStr;
 use std::{
     collections::{hash_map, HashMap},
@@ -59,6 +61,11 @@ fn main() -> Result<(), DynError> {
                         let resp = find_definition(params, &docs, request.id)?;
                         conn.sender.send(resp)?;
                     }
+                    Completion::METHOD => {
+                        let params = serde_json::from_value(request.params)?;
+                        let resp = generate_completions(params, &docs, request.id)?;
+                        conn.sender.send(resp)?;
+                    }
                     _ => {
                         log::info!("ignoring request: {request:?}");
                     }
@@ -81,6 +88,40 @@ fn main() -> Result<(), DynError> {
 
     io_threads.join()?;
     Ok(())
+}
+
+fn generate_completions(
+    params: CompletionParams,
+    docs: &HashMap<Uri, Document>,
+    id: RequestId,
+) -> Result<Message, DynError> {
+    let uri = params.text_document_position.text_document.uri;
+    let loc = params.text_document_position.position;
+    let doc_module = module_from_uri(&uri);
+    let mut completions = Vec::new();
+    if let Some(Document { lines, imports, .. }) = docs.get(&uri) {
+        let ident = get_identifier(&lines[loc.line as usize], loc.character);
+        let item_module = module_of_ident(&ident, &doc_module, imports);
+        for (_uri, module) in module_files(docs, item_module) {
+            completions.extend(module.items.iter().map(|item| CompletionItem {
+                label: item.name.to_string(),
+                kind: match item.kind {
+                    doc::HareKind::Type => Some(CompletionItemKind::STRUCT),
+                    doc::HareKind::Fn => Some(CompletionItemKind::FUNCTION),
+                    doc::HareKind::Def => Some(CompletionItemKind::CONSTANT),
+                    doc::HareKind::Var => Some(CompletionItemKind::VARIABLE),
+                },
+                ..Default::default()
+            }));
+        }
+    }
+    Ok(Response::new_ok(id.clone(), CompletionResponse::Array(completions)).into())
+}
+
+fn module_of_ident(ident: &Ident, current_module: &str, imports: &[Ident]) -> SmolStr {
+    let resolved_ident = resolve_ident(current_module, &ident, imports);
+    let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
+    item_module.clone()
 }
 
 fn find_definition(
@@ -137,14 +178,17 @@ fn path_to_uri(filepath: &Path) -> Result<Uri, DynError> {
 fn resolve_ident(current_module: &str, ident: &Ident, imports: &[Ident]) -> Ident {
     for import in imports.iter() {
         if import.last() == ident.first() {
-            let mut ret = import.clone();
-            ret.extend(ident[1..].iter().cloned());
-            return ret;
+            return import
+                .clone()
+                .into_iter()
+                .chain(ident[1..].iter().cloned())
+                .collect();
         }
     }
-    let mut ret = smallvec::smallvec![current_module.into()];
-    ret.extend(ident.iter().cloned());
-    ret
+    [SmolStr::from(current_module)]
+        .into_iter()
+        .chain(ident.iter().cloned())
+        .collect()
 }
 
 pub fn initialize_docs(
