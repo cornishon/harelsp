@@ -50,7 +50,7 @@ fn main() -> Result<(), DynError> {
         match conn.receiver.recv()? {
             Message::Request(request) => {
                 if conn.handle_shutdown(&request)? {
-                    eprintln!("Exiting...");
+                    log::info!("Exiting...");
                     break;
                 }
                 match request.method.as_str() {

@@ -41,7 +41,7 @@ impl Document {
             Some(
                 self.lines[start + 1..item_line]
                     .iter()
-                    .map(|line| &line[2..])
+                    .flat_map(|line| [&line[2..], "\n"])
                     .collect(),
             )
         } else {
