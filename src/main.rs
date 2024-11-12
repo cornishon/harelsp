@@ -2,28 +2,22 @@
 #![allow(clippy::mutable_key_type)]
 
 mod doc;
-use crate::doc::Ident;
-use crate::doc::{Document, HareItem};
+use crate::doc::{get_identifier, Document, HareItem, Ident};
 
-use doc::get_identifier;
-use lsp_types::request::{Completion, HoverRequest};
-use lsp_types::{
-    notification::{DidOpenTextDocument, Notification},
-    request::{GotoDefinition, Request},
-    CompletionOptions, DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse,
-    Location, OneOf, ServerCapabilities, Uri,
-};
-use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation, Hover,
-    HoverContents, HoverParams, MarkedString,
-};
-use smol_str::SmolStr;
 use std::{
     collections::{hash_map, HashMap},
     path::{Component, Path, PathBuf},
 };
 
-use lsp_server::{Connection, ErrorCode, Message, RequestId, Response};
+use lsp_server::{Connection, Message, Response};
+use lsp_types::{
+    notification::{DidOpenTextDocument, Notification},
+    request::{Completion, GotoDefinition, HoverRequest, Request},
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    DidOpenTextDocumentParams, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, Location, MarkedString, OneOf, ServerCapabilities, Uri,
+};
+use smol_str::SmolStr;
 
 const HAREPATH: &str = match option_env!("HAREPATH") {
     Some(path) => path,
@@ -62,18 +56,21 @@ fn main() -> Result<(), DynError> {
                 match request.method.as_str() {
                     GotoDefinition::METHOD => {
                         let params = serde_json::from_value(request.params)?;
-                        let resp = find_definition(params, &docs, request.id)?;
-                        conn.sender.send(resp)?;
+                        let defs = find_definition(params, &docs);
+                        conn.sender
+                            .send(Response::new_ok(request.id, defs).into())?;
                     }
                     Completion::METHOD => {
                         let params = serde_json::from_value(request.params)?;
-                        let resp = generate_completions(params, &docs, request.id)?;
-                        conn.sender.send(resp)?;
+                        let completions = generate_completions(params, &docs);
+                        conn.sender
+                            .send(Response::new_ok(request.id, completions).into())?;
                     }
                     HoverRequest::METHOD => {
                         let params = serde_json::from_value(request.params)?;
-                        let resp = generate_hover(params, &docs, request.id)?;
-                        conn.sender.send(resp)?;
+                        let hover = generate_hover(params, &docs);
+                        conn.sender
+                            .send(Response::new_ok(request.id, hover).into())?;
                     }
                     _ => {
                         log::info!("ignoring request: {request:?}");
@@ -81,7 +78,7 @@ fn main() -> Result<(), DynError> {
                 };
             }
             Message::Response(response) => {
-                eprintln!("{response:?}");
+                log::info!("{response:?}");
             }
             Message::Notification(notification) => match notification.method.as_str() {
                 DidOpenTextDocument::METHOD => {
@@ -89,7 +86,7 @@ fn main() -> Result<(), DynError> {
                     initialize_docs(params, &mut docs, &search_paths)?;
                 }
                 _ => {
-                    eprintln!("INFO: ignoring notification: {notification:?}");
+                    log::info!("ignoring notification: {notification:?}");
                 }
             },
         }
@@ -99,11 +96,7 @@ fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-fn generate_hover(
-    params: HoverParams,
-    docs: &HashMap<Uri, Document>,
-    id: RequestId,
-) -> Result<Message, DynError> {
+fn generate_hover(params: HoverParams, docs: &HashMap<Uri, Document>) -> Option<Hover> {
     let uri = params.text_document_position_params.text_document.uri;
     let loc = params.text_document_position_params.position;
     let doc_module = module_from_uri(&uri);
@@ -112,22 +105,20 @@ fn generate_hover(
         let item_module = module_of_ident(&ident, &doc_module, imports);
         for (_uri, module) in module_files(docs, item_module) {
             if let Some(item) = find_item(&module.items, &ident) {
-                let documentation = module.get_documentation(item).map(|d| Hover {
+                return module.get_documentation(item).map(|d| Hover {
                     contents: HoverContents::Scalar(MarkedString::String(d)),
                     range: Some(item.range),
                 });
-                return Ok(Response::new_ok(id.clone(), documentation).into());
             }
         }
     }
-    Ok(Response::new_ok(id.clone(), None::<Option<HoverContents>>).into())
+    None
 }
 
 fn generate_completions(
     params: CompletionParams,
     docs: &HashMap<Uri, Document>,
-    id: RequestId,
-) -> Result<Message, DynError> {
+) -> CompletionResponse {
     let uri = params.text_document_position.text_document.uri;
     let loc = params.text_document_position.position;
     let doc_module = module_from_uri(&uri);
@@ -149,7 +140,7 @@ fn generate_completions(
             }));
         }
     }
-    Ok(Response::new_ok(id.clone(), CompletionResponse::Array(completions)).into())
+    CompletionResponse::Array(completions)
 }
 
 fn module_of_ident(ident: &Ident, current_module: &str, imports: &[Ident]) -> SmolStr {
@@ -161,11 +152,11 @@ fn module_of_ident(ident: &Ident, current_module: &str, imports: &[Ident]) -> Sm
 fn find_definition(
     params: GotoDefinitionParams,
     docs: &HashMap<Uri, Document>,
-    id: RequestId,
-) -> Result<Message, DynError> {
+) -> GotoDefinitionResponse {
     let uri = params.text_document_position_params.text_document.uri;
     let loc = params.text_document_position_params.position;
     let doc_module = module_from_uri(&uri);
+    let mut locations = Vec::with_capacity(4);
     if let Some(Document { lines, imports, .. }) = docs.get(&uri) {
         if let Some(line) = lines.get(loc.line as usize) {
             let ident = get_identifier(line, loc.character);
@@ -173,21 +164,19 @@ fn find_definition(
             let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
             for (uri, content) in module_files(docs, item_module.clone()) {
                 if let Some(item) = find_item(&content.items, &ident) {
-                    let resp = GotoDefinitionResponse::Scalar(Location {
+                    locations.push(Location {
                         uri: uri.clone(),
                         range: item.range,
                     });
-                    return Ok(Response::new_ok(id.clone(), resp).into());
                 }
             }
         }
     };
-    Ok(Response::new_err(
-        id.clone(),
-        ErrorCode::RequestFailed as i32,
-        "not found".to_string(),
-    )
-    .into())
+    if locations.len() == 1 {
+        GotoDefinitionResponse::Scalar(locations.pop().unwrap())
+    } else {
+        GotoDefinitionResponse::Array(locations)
+    }
 }
 
 fn find_item<'i>(items: &'i [HareItem], ident: &Ident) -> Option<&'i HareItem> {
@@ -242,7 +231,7 @@ fn add_docs_from_directory(
 ) -> Result<(), DynError> {
     if dir_path.is_dir() {
         let Ok(dir) = std::fs::read_dir(dir_path) else {
-            eprintln!("WARNING: could not open: {}", dir_path.display());
+            log::warn!("could not open: {}", dir_path.display());
             return Ok(());
         };
         for entry in dir {
@@ -262,7 +251,7 @@ fn add_docs_from_directory(
                     .file_name()
                     .is_some_and(|name| name.as_encoded_bytes().starts_with(b"+"))
             {
-                // eprintln!("INFO: indexing subdirectory: {}", entry_path.display());
+                // log::info!("indexing subdirectory: {}", entry_path.display());
                 add_docs_from_directory(docs, &entry_path)?;
             }
         }
