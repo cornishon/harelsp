@@ -6,7 +6,7 @@ use crate::doc::Ident;
 use crate::doc::{Document, HareItem};
 
 use doc::get_identifier;
-use lsp_types::request::Completion;
+use lsp_types::request::{Completion, HoverRequest};
 use lsp_types::{
     notification::{DidOpenTextDocument, Notification},
     request::{GotoDefinition, Request},
@@ -14,7 +14,8 @@ use lsp_types::{
     Location, OneOf, ServerCapabilities, Uri,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation, Hover,
+    HoverContents, HoverParams, MarkedString,
 };
 use smol_str::SmolStr;
 use std::{
@@ -42,6 +43,7 @@ fn main() -> Result<(), DynError> {
             trigger_characters: Some(vec![":".into()]),
             ..Default::default()
         }),
+        hover_provider: Some(true.into()),
         ..Default::default()
     };
     let server_capabilities = serde_json::to_value(capabilities).unwrap();
@@ -68,6 +70,11 @@ fn main() -> Result<(), DynError> {
                         let resp = generate_completions(params, &docs, request.id)?;
                         conn.sender.send(resp)?;
                     }
+                    HoverRequest::METHOD => {
+                        let params = serde_json::from_value(request.params)?;
+                        let resp = generate_hover(params, &docs, request.id)?;
+                        conn.sender.send(resp)?;
+                    }
                     _ => {
                         log::info!("ignoring request: {request:?}");
                     }
@@ -90,6 +97,30 @@ fn main() -> Result<(), DynError> {
 
     io_threads.join()?;
     Ok(())
+}
+
+fn generate_hover(
+    params: HoverParams,
+    docs: &HashMap<Uri, Document>,
+    id: RequestId,
+) -> Result<Message, DynError> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let loc = params.text_document_position_params.position;
+    let doc_module = module_from_uri(&uri);
+    if let Some(Document { lines, imports, .. }) = docs.get(&uri) {
+        let ident = get_identifier(&lines[loc.line as usize], loc.character);
+        let item_module = module_of_ident(&ident, &doc_module, imports);
+        for (_uri, module) in module_files(docs, item_module) {
+            if let Some(item) = find_item(&module.items, &ident) {
+                let documentation = module.get_documentation(item).map(|d| Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(d)),
+                    range: Some(item.range),
+                });
+                return Ok(Response::new_ok(id.clone(), documentation).into());
+            }
+        }
+    }
+    Ok(Response::new_ok(id.clone(), None::<Option<HoverContents>>).into())
 }
 
 fn generate_completions(
@@ -141,7 +172,11 @@ fn find_definition(
             let resolved_ident = resolve_ident(doc_module.as_str(), &ident, imports);
             let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
             for (uri, content) in module_files(docs, item_module.clone()) {
-                if let Some(resp) = item_definition(uri, &content.items, &ident) {
+                if let Some(item) = find_item(&content.items, &ident) {
+                    let resp = GotoDefinitionResponse::Scalar(Location {
+                        uri: uri.clone(),
+                        range: item.range,
+                    });
                     return Ok(Response::new_ok(id.clone(), resp).into());
                 }
             }
@@ -155,19 +190,12 @@ fn find_definition(
     .into())
 }
 
-fn item_definition(
-    doc_uri: &Uri,
-    items: &[HareItem],
-    ident: &Ident,
-) -> Option<GotoDefinitionResponse> {
+fn find_item<'i>(items: &'i [HareItem], ident: &Ident) -> Option<&'i HareItem> {
     let expected = ident.last().unwrap().clone();
     let local = ident.len() == 1;
     for item in items {
         if item.name == expected && (local || item.exported) {
-            return Some(GotoDefinitionResponse::Scalar(Location {
-                uri: doc_uri.clone(),
-                range: item.range,
-            }));
+            return Some(item);
         }
     }
     None
