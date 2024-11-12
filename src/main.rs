@@ -20,9 +20,9 @@ use std::{
 
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response};
 
-const HARE_PATH: &str = match option_env!("HARE_PATH") {
+const HAREPATH: &str = match option_env!("HAREPATH") {
     Some(path) => path,
-    None => "/usr/local/src/hare/stdlib/:/usr/local/src/hare/thirdparty/",
+    None => "/usr/local/src/hare/stdlib/:/usr/local/src/hare/third-party/",
 };
 
 type DynError = Box<dyn core::error::Error + Sync + Send>;
@@ -44,7 +44,7 @@ fn main() -> Result<(), DynError> {
     let _initialization_params = conn.initialize(server_capabilities)?;
     let mut docs = HashMap::<Uri, Document>::new();
 
-    let search_paths = HARE_PATH.split(':').collect::<Vec<_>>();
+    let search_paths = HAREPATH.split(':').collect::<Vec<_>>();
 
     loop {
         match conn.receiver.recv()? {
