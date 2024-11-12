@@ -19,11 +19,6 @@ use lsp_types::{
 };
 use smol_str::SmolStr;
 
-const HAREPATH: &str = match option_env!("HAREPATH") {
-    Some(path) => path,
-    None => "/usr/local/src/hare/stdlib/:/usr/local/src/hare/third-party/",
-};
-
 type DynError = Box<dyn core::error::Error + Sync + Send>;
 
 fn main() -> Result<(), DynError> {
@@ -40,11 +35,14 @@ fn main() -> Result<(), DynError> {
         hover_provider: Some(true.into()),
         ..Default::default()
     };
-    let server_capabilities = serde_json::to_value(capabilities).unwrap();
+    let server_capabilities = serde_json::to_value(capabilities)?;
     let _initialization_params = conn.initialize(server_capabilities)?;
     let mut docs = HashMap::<Uri, Document>::new();
 
-    let search_paths = HAREPATH.split(':').collect::<Vec<_>>();
+    let harepath: String = std::env::var("HAREPATH")
+        .unwrap_or("/usr/local/src/hare/stdlib/:/usr/local/src/hare/third-party/".to_owned());
+
+    let search_paths = harepath.split(':').collect::<Vec<_>>();
 
     loop {
         match conn.receiver.recv()? {
