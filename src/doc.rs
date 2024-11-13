@@ -82,7 +82,12 @@ pub const PREFIXES: &[(&str, bool, HareKind)] = &[
 pub fn parse_items(doc_lines: &[String]) -> Vec<HareItem> {
     let mut out = Vec::new();
     for (ln, line) in doc_lines.iter().enumerate() {
-        for &(prefix, exported, kind) in PREFIXES {
+        for &(mut prefix, exported, kind) in PREFIXES {
+            if let Some(at_idx) = line.find("@symbol") {
+                let symbol_end = at_idx + line[at_idx..].find(')').unwrap();
+                prefix = &line[..prefix.len() + symbol_end - at_idx];
+                log::info!("{prefix}");
+            };
             if let Some(s) = line.strip_prefix(prefix) {
                 let name: SmolStr = s
                     .trim()
@@ -90,10 +95,10 @@ pub fn parse_items(doc_lines: &[String]) -> Vec<HareItem> {
                     .next()
                     .unwrap()
                     .into();
-                let start = line.find(name.as_str()).unwrap() as u32;
+                let start = line[prefix.len()..].find(name.as_str()).unwrap() + prefix.len();
                 let range = Range::new(
-                    Position::new(ln as u32, start),
-                    Position::new(ln as u32, start + name.len() as u32),
+                    Position::new(ln as u32, start as u32),
+                    Position::new(ln as u32, start as u32 + name.len() as u32),
                 );
                 out.push(HareItem {
                     kind,
