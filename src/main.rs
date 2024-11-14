@@ -139,7 +139,7 @@ fn generate_completions(
                     doc::HareKind::Def => Some(CompletionItemKind::CONSTANT),
                     doc::HareKind::Var => Some(CompletionItemKind::VARIABLE),
                 },
-                documentation: module.get_documentation(&item).map(Documentation::String),
+                documentation: module.get_documentation(item).map(Documentation::String),
                 ..Default::default()
             }));
         }
@@ -148,7 +148,7 @@ fn generate_completions(
 }
 
 fn module_of_ident(ident: &Ident, current_module: &str, imports: &HashSet<Ident>) -> SmolStr {
-    let resolved_ident = resolve_ident(current_module, &ident, imports);
+    let resolved_ident = resolve_ident(current_module, ident, imports);
     let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
     item_module.clone()
 }
@@ -186,12 +186,9 @@ fn find_definition(
 fn find_item<'i>(items: &'i HashSet<HareItem>, ident: &Ident) -> Option<&'i HareItem> {
     let expected = ident.last().unwrap().clone();
     let local = ident.len() == 1;
-    for item in items {
-        if item.name == expected && (local || item.exported) {
-            return Some(item);
-        }
-    }
-    None
+    items
+        .iter()
+        .find(|&item| item.name == expected && (local || item.exported))
 }
 
 fn path_to_uri(filepath: &Path) -> Result<Uri, DynError> {
@@ -237,16 +234,6 @@ pub fn update_docs(
     let uri = params.text_document.uri;
     log::info!("{:?}", params.content_changes);
     if let Some(doc) = docs.remove(&uri) {
-        // let mut lines = doc.lines;
-        // for change in params.content_changes.iter() {
-        //     let range = change.range.unwrap_or_default();
-        //     let start = range.start.line as usize;
-        //     let end = range.end.line as usize;
-        //     assert_eq!(range.start.character, 0);
-        //     assert_eq!(range.end.character, 0);
-        //     let changed_lines = change.text.lines().map(String::from);
-        //     lines.splice(start..end, changed_lines);
-        // }
         assert!(params.content_changes.len() == 1);
         let updated_doc = Document::new(
             params.content_changes[0]
