@@ -5,17 +5,18 @@ mod doc;
 use crate::doc::{get_identifier, Document, HareItem, Ident};
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
 };
 
 use lsp_server::{Connection, Message, Response};
 use lsp_types::{
-    notification::{DidOpenTextDocument, Notification},
+    notification::{DidChangeTextDocument, DidOpenTextDocument, Notification},
     request::{Completion, GotoDefinition, HoverRequest, Request},
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    DidOpenTextDocumentParams, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, Location, MarkedString, OneOf, ServerCapabilities, Uri,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkedString, OneOf,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use smol_str::SmolStr;
 
@@ -32,6 +33,7 @@ fn main() -> Result<(), DynError> {
             trigger_characters: Some(vec![":".into()]),
             ..Default::default()
         }),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(true.into()),
         ..Default::default()
     };
@@ -82,6 +84,10 @@ fn main() -> Result<(), DynError> {
                 DidOpenTextDocument::METHOD => {
                     let params = serde_json::from_value(notification.params)?;
                     initialize_docs(params, &mut docs, &search_paths)?;
+                }
+                DidChangeTextDocument::METHOD => {
+                    let params = serde_json::from_value(notification.params)?;
+                    update_docs(params, &mut docs, &search_paths)?;
                 }
                 _ => {
                     log::info!("ignoring notification: {notification:?}");
@@ -141,7 +147,7 @@ fn generate_completions(
     CompletionResponse::Array(completions)
 }
 
-fn module_of_ident(ident: &Ident, current_module: &str, imports: &[Ident]) -> SmolStr {
+fn module_of_ident(ident: &Ident, current_module: &str, imports: &HashSet<Ident>) -> SmolStr {
     let resolved_ident = resolve_ident(current_module, &ident, imports);
     let item_module = &resolved_ident[resolved_ident.len().saturating_sub(2)];
     item_module.clone()
@@ -177,7 +183,7 @@ fn find_definition(
     }
 }
 
-fn find_item<'i>(items: &'i [HareItem], ident: &Ident) -> Option<&'i HareItem> {
+fn find_item<'i>(items: &'i HashSet<HareItem>, ident: &Ident) -> Option<&'i HareItem> {
     let expected = ident.last().unwrap().clone();
     let local = ident.len() == 1;
     for item in items {
@@ -193,7 +199,7 @@ fn path_to_uri(filepath: &Path) -> Result<Uri, DynError> {
     Ok(uri)
 }
 
-fn resolve_ident(current_module: &str, ident: &Ident, imports: &[Ident]) -> Ident {
+fn resolve_ident(current_module: &str, ident: &Ident, imports: &HashSet<Ident>) -> Ident {
     for import in imports.iter() {
         if import.last() == ident.first() {
             return import
@@ -216,10 +222,46 @@ pub fn initialize_docs(
 ) -> Result<(), DynError> {
     let uri = params.text_document.uri;
     let root = Document::open(&uri)?;
-    add_docs_from_imports(docs, &root.imports, search_paths)?;
+    add_docs_from_imports(docs, root.imports.iter(), search_paths)?;
     let doc_path = Path::new(uri.path().as_str());
     add_docs_from_directory(docs, doc_path.parent().unwrap())?;
     docs.insert(uri, root);
+    Ok(())
+}
+
+pub fn update_docs(
+    params: DidChangeTextDocumentParams,
+    docs: &mut HashMap<Uri, Document>,
+    search_paths: &[&str],
+) -> Result<(), DynError> {
+    let uri = params.text_document.uri;
+    log::info!("{:?}", params.content_changes);
+    if let Some(doc) = docs.remove(&uri) {
+        // let mut lines = doc.lines;
+        // for change in params.content_changes.iter() {
+        //     let range = change.range.unwrap_or_default();
+        //     let start = range.start.line as usize;
+        //     let end = range.end.line as usize;
+        //     assert_eq!(range.start.character, 0);
+        //     assert_eq!(range.end.character, 0);
+        //     let changed_lines = change.text.lines().map(String::from);
+        //     lines.splice(start..end, changed_lines);
+        // }
+        assert!(params.content_changes.len() == 1);
+        let updated_doc = Document::new(
+            params.content_changes[0]
+                .text
+                .lines()
+                .map(String::from)
+                .collect(),
+        );
+        add_docs_from_imports(
+            docs,
+            updated_doc.imports.difference(&doc.imports),
+            search_paths,
+        )?;
+        docs.insert(uri, updated_doc);
+    };
     Ok(())
 }
 
@@ -237,12 +279,10 @@ fn add_docs_from_directory(
             let entry_path = entry.path();
             if entry_path.is_file() && entry_path.extension().is_some_and(|ext| ext == "ha") {
                 let uri = path_to_uri(&entry_path)?;
-                if let hash_map::Entry::Vacant(e) = docs.entry(uri.clone()) {
-                    if let Ok(doc) = Document::open(&uri) {
-                        e.insert(doc);
-                    } else {
-                        eprintln!("WARNING: could not open: {}", entry_path.display());
-                    }
+                if let Ok(doc) = Document::open(&uri) {
+                    docs.insert(uri, doc);
+                } else {
+                    eprintln!("WARNING: could not open: {}", entry_path.display());
                 }
             } else if entry_path.is_dir()
                 && entry_path
@@ -257,13 +297,13 @@ fn add_docs_from_directory(
     Ok(())
 }
 
-fn add_docs_from_imports(
+fn add_docs_from_imports<'i, I: Iterator<Item = &'i Ident>>(
     docs: &mut HashMap<Uri, Document>,
-    imports: &[Ident],
+    imports: I,
     search_paths: &[&str],
 ) -> Result<(), DynError> {
-    for path in search_paths.iter() {
-        for import in imports.iter() {
+    for import in imports {
+        for path in search_paths.iter() {
             let mut module_path = PathBuf::from(path);
             module_path.extend(import);
             add_docs_from_directory(docs, &module_path)?;

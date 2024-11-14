@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::File,
     io::{self, BufRead, BufReader},
 };
@@ -9,11 +10,11 @@ use smol_str::SmolStr;
 
 pub type Ident = SmallVec<[SmolStr; 4]>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub lines: Vec<String>,
-    pub imports: Vec<Ident>,
-    pub items: Vec<HareItem>,
+    pub imports: HashSet<Ident>,
+    pub items: HashSet<HareItem>,
 }
 
 impl Document {
@@ -30,6 +31,16 @@ impl Document {
             items,
             imports,
         })
+    }
+
+    pub fn new(lines: Vec<String>) -> Self {
+        let items = parse_items(&lines);
+        let imports = get_imports(&lines);
+        Document {
+            lines,
+            items,
+            imports,
+        }
     }
 
     pub fn get_documentation(&self, item: &HareItem) -> Option<String> {
@@ -79,14 +90,14 @@ pub const PREFIXES: &[(&str, bool, HareKind)] = &[
     ("const", false, HareKind::Var),
 ];
 
-pub fn parse_items(doc_lines: &[String]) -> Vec<HareItem> {
-    let mut out = Vec::new();
+pub fn parse_items(doc_lines: &[String]) -> HashSet<HareItem> {
+    let mut out = HashSet::new();
     for (ln, line) in doc_lines.iter().enumerate() {
         for &(mut prefix, exported, kind) in PREFIXES {
             if let Some(at_idx) = line.find("@symbol") {
                 let symbol_end = at_idx + line[at_idx..].find(')').unwrap();
                 prefix = &line[..prefix.len() + symbol_end - at_idx];
-                log::info!("{prefix}");
+                // log::info!("{prefix}");
             };
             if let Some(s) = line.strip_prefix(prefix) {
                 let name: SmolStr = s
@@ -100,7 +111,7 @@ pub fn parse_items(doc_lines: &[String]) -> Vec<HareItem> {
                     Position::new(ln as u32, start as u32),
                     Position::new(ln as u32, start as u32 + name.len() as u32),
                 );
-                out.push(HareItem {
+                out.insert(HareItem {
                     kind,
                     name,
                     range,
@@ -112,7 +123,7 @@ pub fn parse_items(doc_lines: &[String]) -> Vec<HareItem> {
     out
 }
 
-pub fn get_imports(source: &[String]) -> Vec<Ident> {
+pub fn get_imports(source: &[String]) -> HashSet<Ident> {
     source
         .iter()
         .filter_map(|l| {
